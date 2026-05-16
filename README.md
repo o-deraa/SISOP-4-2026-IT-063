@@ -273,9 +273,400 @@ Fungsi di atas akan menambah tepat satu newline di akhir dan set null terminator
 #### HASIL AKHIR:
 ![alt text](image-9.png)
 
-### SOAL 2 -
+### SOAL 2 - Poke MOO
+
+#### a - Buat fuse.c
+Soal meminta untuk membuat file `fuse.c` yang mengaplikasikan 12 callback function dari FUSE Library. Callback function adalah fungsi yang dipanggil oleh FUSE daemon ketika kernel mengirimkan operasi filesystem. Setiap callback menangani satu jenis operasi filesystem.
+
+- Struktur dan definisi
+```c
+#define FUSE_USE_VERSION 26
+#include <fuse.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <dirent.h>
+#include <errno.h>
+#include <sys/xattr.h>
+#include <sys/time.h>
+
+#define ENCRYPTION_KEY 0x76
+#define MAX_PATH 4096
+
+typedef struct {
+    char *encrypted_dir;
+} fuse_context_t;
+```
+
+Contoh beberapa implementasi callback function yaitu sebagai berikut:
+- getattr
+```c
+static int moo_getattr(const char *path, struct stat *stbuf) {
+    fuse_context_t *ctx = (fuse_context_t *)fuse_get_context()->private_data;
+    char encrypted_path[MAX_PATH];
+    get_encrypted_path(path, encrypted_path, ctx->encrypted_dir);
+
+    int res = stat(encrypted_path, stbuf);
+    if (res == -1)
+        return -errno;
+
+    return 0;
+}
+```
+
+- readdir
+
+```c
+static int moo_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info *fi) {
+    (void)offset;
+    (void)fi;
+
+    fuse_context_t *ctx = (fuse_context_t *)fuse_get_context()->private_data;
+    char encrypted_path[MAX_PATH];
+    get_encrypted_dir_path(path, encrypted_path, ctx->encrypted_dir);
+
+    DIR *dp = opendir(encrypted_path);
+    if (!dp)
+        return -errno;
+
+    struct dirent *de;
+    while ((de = readdir(dp)) != NULL) {
+        struct stat st;
+        memset(&st, 0, sizeof(st));
+        st.st_ino = de->d_ino;
+        st.st_mode = de->d_type << 12;
+
+        char decrypted_name[256];
+        get_decrypted_filename(de->d_name, decrypted_name);
+
+        if (filler(buf, decrypted_name, &st, 0))
+            break;
+    }
+
+    closedir(dp);
+    return 0;
+```
+
+Implementasi callback function lainnya mengikuti pattern yang sama, yakni mengambil path dari FUSE, mengkonversi ke encrypted path, memanggil system call yang sesuai pada encrypted path, dan mengembalikan hasil.
+
+Callback function lalu didaftarkan di struck dan `main` function dipanggil.
+```c
+static struct fuse_operations moo_oper = {
+    .getattr = moo_getattr,
+    .readdir = moo_readdir,
+    .mkdir = moo_mkdir,
+    .rmdir = moo_rmdir,
+    .create = moo_create,
+    .open = moo_open,
+    .read = moo_read,
+    .write = moo_write,
+    .truncate = moo_truncate,
+    .unlink = moo_unlink,
+    .access = moo_access,
+    .utimens = moo_utimens,
+    .flush = moo_flush,
+};
+
+int main(int argc, char *argv[]) {
+    // ... setup code ...
+    return fuse_main(argc, argv, &moo_oper, &ctx);
+}
+```
+
+#### Server
+Untuk memperoleh file `server` yang disediakan soal, file harus didwonlaod terbelih dahulu menggunakan `gdown`
+
 ![alt text](image-2.png)
+
+#### b - Mounting
+Soal meminta agar `fuse_mount/` berfungsi seperti direktori normal yang dapat dibaca dan ditulis. User harus bisa melakukan semua operasi filesystem standar (membuat file/folder, membaca, menghapus, dll) pada `fuse_mount/` seolah-olah itu direktori biasa. Operasi apapun yang dilakukan pada `fuse_mount/` harus tercermin di `encrypted_storage/`.
+
+![alt text](image-10.png)
+
+![alt text](image-11.png)
+
+
+#### c - Enkripsi
+Soal meminta agar user tidak perlu tahu tentang enkripsi, tapi semua file di `encrypted_storage/` tersimpan terenkripsi. Ketika user menulis file ke `fuse_mount/`, FUSE secara otomatis mengenkripsi dan menyimpannya dengan `suffix .enc`. Ketika user membaca file dari `fuse_mount/`, FUSE secara otomatis mendekripsi. File di `fuse_mount/` tampil normal tanpa `suffix .enc`, sementara file di `encrypted_storage/` tersimpan dengan `.enc` dan terenkripsi.
+
+- Enkripsi XOR
+```c
+void xor_crypt(unsigned char *data, size_t len) {
+    for (size_t i = 0; i < len; i++) {
+        data[i] ^= ENCRYPTION_KEY;
+    }
+}
+```
+
+Fungsi ini beroperasi secara sederhana dengan menerapkan operasi XOR menggunakan key 0x76 pada setiap byte.
+
+- Baca file enkripsi
+```c
+int read_encrypted_file(const char *path, unsigned char *buf, size_t size, off_t offset) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return -errno;
+
+    fseek(f, offset, SEEK_SET);
+    int nread = fread(buf, 1, size, f);
+    fclose(f);
+
+    if (nread > 0) {
+        xor_crypt(buf, nread);
+    }
+
+    return nread;
+}
+```
+
+Fungsi ini membuka file terenkripsi, membaca bytes, mendekripsi dengan XOR, dan mengembalikan plaintext.
+
+- Tulis file enkripsi
+```c
+int write_encrypted_file(const char *path, const unsigned char *buf, size_t size, off_t offset) {
+    FILE *f = fopen(path, "r+b");
+    if (!f) {
+        f = fopen(path, "wb");
+        if (!f) return -errno;
+    }
+
+    unsigned char *encrypted_buf = malloc(size);
+    if (!encrypted_buf) {
+        fclose(f);
+        return -ENOMEM;
+    }
+
+    memcpy(encrypted_buf, buf, size);
+    xor_crypt(encrypted_buf, size);
+
+    fseek(f, offset, SEEK_SET);
+    int nwritten = fwrite(encrypted_buf, 1, size, f);
+    fclose(f);
+    free(encrypted_buf);
+
+    return nwritten > 0 ? nwritten : -errno;
+}
+```
+Fungsi ini membuat copy plaintext, mengenkripsi copy dengan XOR, dan menulis encrypted bytes ke file.
+
+- Suffic `.enc`
+```c
+static void get_encrypted_file_path(const char *fuse_path, char *encrypted_path, const char *encrypted_dir) {
+    if (strcmp(fuse_path, "/") == 0) {
+        strcpy(encrypted_path, encrypted_dir);
+        return;
+    }
+    snprintf(encrypted_path, MAX_PATH, "%s%s.enc", encrypted_dir, fuse_path);
+}
+
+static void get_encrypted_dir_path(const char *fuse_path, char *encrypted_path, const char *encrypted_dir) {
+    if (strcmp(fuse_path, "/") == 0) {
+        strcpy(encrypted_path, encrypted_dir);
+        return;
+    }
+    snprintf(encrypted_path, MAX_PATH, "%s%s", encrypted_dir, fuse_path);
+}
+```
+Kedua fungsi ini digunakan untuk menerjemahkan path yang dilihat user di filesystem FUSE menjadi path asli yang digunakan di folder penyimpanan terenkripsi. Fungsi `get_encrypted_file_path()` dipakai untuk file, sehingga jika user mengakses path seperti `/data.txt`, maka path tersebut akan diubah menjadi bentuk fisik di folder terenkripsi dengan tambahan ekstensi `.enc`, misalnya `encrypted_storage/data.txt.enc`. Hal ini menunjukkan bahwa file yang disimpan di storage asli adalah versi terenkripsi. Sementara itu, fungsi `get_encrypted_dir_path()` dipakai untuk directory, sehingga path seperti `/folder` hanya diubah menjadi `encrypted_storage/folder` tanpa tambahan `.enc`, karena directory tidak diperlakukan sebagai file terenkripsi. Untuk path root `"/"`, kedua fungsi langsung mengembalikan `encrypted_dir` karena root FUSE merepresentasikan folder utama penyimpanan terenkripsi itu sendiri.
+
+![alt text](image-12.png)
+
+![alt text](image-13.png)
+
+#### d - Check Fuse berhasil atau tidak
+Soal mmeinta testing untuk memverifikasi bahwa FUSE implementation bekerja dengan benar. Spesifik testing adalah membuat direktori `tests/` pada direktori `encrypted_storage/`, menempatkan file `notes.csv.env`, dan memastikan file dapat dibaca melalui `fuse_mount/` dengan content terlihat (terdekripsi).
+
+
+![alt text](image-14.png)
+
+
+#### Container
+Soal meminta database server dikemas ke dalam Docker image. Docker image adalah blueprint yang berisi OS, dependencies, dan program yang dapat dijalankan di container tanpa dependensi dari host machine. Untuk itu, diperlukan suatu Dockerfile yang mendefinisikan image. Dockerfile berisi instruksi untuk Docker dalam membangun image - mulai dari base OS, install dependencies, copy files, expose port, dan set startup command.
+
+Image aplikasi harus dibuat dengan base image ubuntu:latest, kemudian copy program ke workdir /app dan expose PORT 9000 disertai dengan tag soal-2-modul-4-sisop.
+
+```dockerfile
+FROM ubuntu:latest
+
+# Set working directory
+WORKDIR /app
+
+# Install necessary dependencies
+RUN apt-get update && apt-get install -y \
+    libfuse-dev \
+    fuse \
+    pkg-config \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy server binary dan fuse program
+COPY server /app/server
+COPY fuse /app/fuse
+
+# Create necessary directories
+RUN mkdir -p /app/db \
+    && mkdir -p /app/encrypted_storage \
+    && mkdir -p /app/fuse_mount
+
+# Make binaries executable
+RUN chmod +x /app/server /app/fuse
+
+# Expose port 9000 untuk database service
+EXPOSE 9000
+
+# Set environment variable untuk workdir
+ENV APP_DB_PATH=/app/db
+ENV ENCRYPTED_STORAGE=/app/encrypted_storage
+ENV FUSE_MOUNT=/app/fuse_mount
+
+# Start the server
+CMD ["./server"]
+
+```
+
+- Run image
+```
+docker build -t soal-2-modul-4-sisop:latest .
+```
 
 ![alt text](image-3.png)
 
 ![alt text](image-4.png)
+
+- Run container
+```bash
+docker run -d \
+  --name db_app \
+  -p 9000:9000 \
+  -v $(pwd)/fuse_mount:/app/db \
+  soal-2-modul-4-sisop:latest
+```
+![alt text](image-15.png)
+
+#### Integration
+Soal meminta untuk membuat program bernama `client.c` yang dapat connect ke database server dan mengirimkan command serta menerima response. Server sudah disediakan dan menjalankan di container di port 9000. Client harus membuka TCP connection, mengirimkan command user, dan menampilkan response.
+
+- clien.c
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <errno.h>
+
+#define SERVER_IP "127.0.0.1"
+#define SERVER_PORT 9000
+#define BUFFER_SIZE 4096
+
+int main() {
+    int sock;
+    struct sockaddr_in server_addr;
+    char send_buffer[BUFFER_SIZE];
+    char recv_buffer[BUFFER_SIZE];
+    int bytes_received;
+
+    // Create socket
+    sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) {
+        perror("socket");
+        exit(EXIT_FAILURE);
+    }
+
+    // Set up server address
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(SERVER_PORT);
+    
+    // Convert IP address
+    if (inet_pton(AF_INET, SERVER_IP, &server_addr.sin_addr) <= 0) {
+        perror("inet_pton");
+        close(sock);
+        exit(EXIT_FAILURE);
+    }
+
+    // Connect to server
+    if (connect(sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+        perror("connect");
+        close(sock);
+        exit(EXIT_FAILURE);
+    }
+
+    printf("Connected to DB Server on port %d\n", SERVER_PORT);
+    printf("Type HELP for available commands\n");
+    printf("Type EXIT to quit\n");
+
+    // Main loop for interactive session
+    while (1) {
+        printf("db > ");
+        fflush(stdout);
+
+        // Read user input
+        if (fgets(send_buffer, BUFFER_SIZE - 1, stdin) == NULL) {
+            if (feof(stdin)) {
+                break;
+            }
+            perror("fgets");
+            continue;
+        }
+
+        // Remove newline from input
+        size_t len = strlen(send_buffer);
+        if (len > 0 && send_buffer[len - 1] == '\n') {
+            send_buffer[len - 1] = '\0';
+        }
+
+        // Check for EXIT command
+        if (strcasecmp(send_buffer, "EXIT") == 0) {
+            printf("Disconnecting from server...\n");
+            close(sock);
+            exit(EXIT_SUCCESS);
+        }
+
+        // Skip empty commands
+        if (strlen(send_buffer) == 0) {
+            continue;
+        }
+
+        // Send command to server
+        if (send(sock, send_buffer, strlen(send_buffer), 0) < 0) {
+            perror("send");
+            close(sock);
+            exit(EXIT_FAILURE);
+        }
+
+        // Receive response from server
+        memset(recv_buffer, 0, BUFFER_SIZE);
+        bytes_received = recv(sock, recv_buffer, BUFFER_SIZE - 1, 0);
+        
+        if (bytes_received < 0) {
+            perror("recv");
+            close(sock);
+            exit(EXIT_FAILURE);
+        } else if (bytes_received == 0) {
+            printf("Server closed connection\n");
+            close(sock);
+            exit(EXIT_FAILURE);
+        }
+
+        recv_buffer[bytes_received] = '\0';
+        printf("%s\n", recv_buffer);
+    }
+
+    close(sock);
+    return EXIT_SUCCESS;
+}
+```
+
+Program ini adalah client TCP sederhana yang digunakan untuk terhubung ke DB Server pada IP `127.0.0.1` dan port `9000`. Program dimulai dengan membuat socket menggunakan `socket(AF_INET, SOCK_STREAM, 0)`, di mana `AF_INET` menunjukkan bahwa komunikasi memakai IPv4, sedangkan `SOCK_STREAM` menunjukkan bahwa protokol yang digunakan adalah TCP. Setelah socket berhasil dibuat, program menyiapkan alamat server menggunakan `struct sockaddr_in`. Struktur ini dikosongkan terlebih dahulu dengan `memset()` agar tidak ada data sampah, lalu diisi dengan informasi server: `sin_family` diisi `AF_INET`, `sin_port` diisi `SERVER_PORT` yang dikonversi menggunakan `htons()` agar sesuai dengan format network byte order, dan `sin_addr` diisi IP server menggunakan `inet_pton()`, yang mengubah string `"127.0.0.1"` menjadi format alamat IP biner yang bisa dipahami oleh sistem socket. Setelah semua informasi server siap, fungsi `connect()` dipanggil untuk melakukan koneksi TCP ke server. Jika koneksi berhasil, berarti client dan server sudah terhubung, sehingga client dapat mulai mengirim perintah dan menerima balasan.
+
+Setelah tersambung, program masuk ke interactive loop, yaitu mode di mana user dapat terus mengetik command melalui terminal. Program menampilkan prompt `db >`, lalu membaca input user menggunakan `fgets()` dan menyimpannya ke `send_buffer`. Jika user mengetik `EXIT`, program akan menutup socket dengan `close(sock)` dan keluar secara normal. Jika input kosong, program langsung kembali meminta command baru tanpa mengirim apa pun. Untuk command yang valid, program mengirim data ke server menggunakan `send()`, lalu menunggu balasan menggunakan `recv()`. Response dari server disimpan ke `recv_buffer`, diberi null terminator `\0`, kemudian ditampilkan ke layar. Jika `recv()` mengembalikan `0`, artinya server menutup koneksi, sehingga client juga berhenti. Dengan alur ini, program bekerja seperti terminal client untuk DB Server: user mengetik command, client mengirim command melalui TCP, server memprosesnya, lalu client menampilkan hasil balasan dari server.
+
+![alt text](image-17.png)
+
+### SOAL 3 - LibraryIT
+
