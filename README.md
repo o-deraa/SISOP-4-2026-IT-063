@@ -1052,43 +1052,266 @@ set_samba_password() {
 
 #### b - Implementasi Role-Based Access Control
 
+Soal kemudian meminta agar:
+
+- ebooks & papers: Staff read-write, readonly read-only (implementasi via Samba read-only + write list)
+- sourcecode: Hanya staff, tidak terlihat untuk readonly (implementasi via valid users)
+- docs: Semua bisa baca, tapi hanya librarian tulis (implementasi via write list + user-specific permission)
+- Semua akses harus teridentifikasi (tidak ada guest access)
+
+Berikut adalah implementasi kode untuk hal - hal tersebut:
+
+- `entrypoint.sh`
+```sh
+# ebooks dan papers:
+chown -R root:staff /libraryit/ebooks /libraryit/papers
+find /libraryit/ebooks /libraryit/papers -type d -exec chmod 0775 {} \;
+find /libraryit/ebooks /libraryit/papers -type f -exec chmod 0664 {} \;
+
+```
+Konfigurasi ini mengatur agar folder `/libraryit/ebooks` dan `/libraryit/papers` dimiliki oleh `root` dengan group `staff`, sehingga kontrol utama ada pada root dan anggota grup `staff`. Directory diberi permission `0775`, artinya owner dan group bisa membaca, menulis, serta masuk ke folder, sementara others masih bisa read dan execute. Jika ingin others benar-benar tidak bisa akses, permission yang lebih tepat adalah `0770`. File diberi permission `0664`, artinya owner dan group bisa membaca serta menulis file, sementara others masih bisa membaca; jika others tidak boleh akses sama sekali, gunakan `0660`. Jika digabungkan dengan Samba, akses tetap dibatasi oleh konfigurasi Samba: `valid users = @readonly @staff` menentukan siapa yang boleh masuk share, sedangkan `write list = @staff` memastikan hanya grup `staff` yang boleh menulis, sehingga user readonly tetap tidak bisa melakukan perubahan meskipun share dapat dibuka.
+
+- `smb.conf` - [global]
+```ini
+[global]
+   workgroup = WORKGROUP
+   server string = LibraryIT Server
+   server role = standalone server
+
+   security = user
+   map to guest = never
+   restrict anonymous = 2
+   usershare allow guests = no
+
+   disable netbios = yes
+
+   load printers = no
+   printing = bsd
+   printcap name = /dev/null
+   disable spoolss = yes
+
+   access based share enum = yes
+
+   log file = /var/log/samba/libraryit-samba.log
+   max log size = 0
+   log level = 2
+```
+
+Konfigurasi ini mengatur Samba agar hanya menerima akses dari user yang benar-benar terautentikasi. `security = user` membuat setiap koneksi harus login menggunakan akun Samba, sementara `map to guest = never`, `restrict anonymous = 2`, dan `usershare allow guests = no` mencegah akses guest atau anonymous, termasuk mencegah user gagal login dialihkan menjadi guest. Dengan begitu, akses ke share tidak bisa dilakukan tanpa username dan password yang valid. Selain itu, `access based share enum = yes` membuat Samba hanya menampilkan daftar share yang memang boleh diakses oleh user tersebut, sehingga share yang tidak memiliki izin akan disembunyikan dari tampilan client.
+
+
+- `smb.conf` - [ebooks] [papers]
+```ini
+[ebooks]
+   path = /libraryit/ebooks
+   browseable = yes
+   guest ok = no
+
+   valid users = @readonly @staff
+   read only = yes
+   write list = @staff
+
+   force group = staff
+   create mask = 0664
+   directory mask = 0775
+
+[papers]
+   path = /libraryit/papers
+   browseable = yes
+   guest ok = no
+
+   valid users = @readonly @staff
+   read only = yes
+   write list = @staff
+
+   force group = staff
+   create mask = 0664
+   directory mask = 0775
+```
+
+Share `ebooks` dan `papers` memiliki pola konfigurasi yang sama, yaitu hanya user dari grup `readonly` dan `staff` yang boleh mengakses karena dibatasi oleh `valid users = @readonly @staff` dan `guest ok = no`. Secara default, kedua share dibuat hanya-baca melalui `read only = yes`, sehingga user biasa dari grup `readonly` hanya dapat melihat dan membaca file tanpa bisa mengubah isi folder. Namun, aturan `write list = @staff` memberikan pengecualian kepada anggota grup `staff` agar tetap bisa membuat, mengedit, atau menghapus file di dalam share tersebut. Dengan `force group = staff`, `create mask = 0664`, dan `directory mask = 0775`, file serta folder baru yang dibuat melalui Samba akan mengikuti kepemilikan grup dan permission yang konsisten untuk kolaborasi antar anggota `staff`.
+
+- `smb.conf` - [SourceCode]
+```ini
+[SourceCode]
+   path = /libraryit/sourcecode
+   browseable = yes
+   guest ok = no
+
+   valid users = @staff
+   read only = yes
+
+   force group = staff
+   create mask = 0640
+   directory mask = 0750
+```
+
+Hanya group `staff` yang masuk ke `valid users`. Karena `member` hanya berada di group `readonly`, maka `member` tidak boleh mengakses share ini. Dengan `access based share enum = yes`, share `SourceCode` juga tidak muncul saat `member` menjalankan listing share.
+
+- `smb.conf` - [docs]
+
+```ini
+[docs]
+   path = /libraryit/docs
+   browseable = yes
+   guest ok = no
+
+   valid users = @readonly @staff
+   read only = yes
+   write list = librarian
+
+   force group = staff
+   create mask = 0644
+   directory mask = 0755
+```
+
+Semua group boleh masuk karena `valid users = @readonly @staff`. Namun, karena `read only = yes`, semua user hanya bisa membaca secara default. Hak tulis hanya diberikan kepada user spesifik `librarian` melalui `write list = librarian`. Ini membuat `contributor` tetap tidak bisa menulis ke `docs`, walaupun ia termasuk group `staff`.
 
 
 #### c - Docker
+
+Selanjutnya, soal meminta:
+
+- Data Persistence: Volume host (`./data/ebooks` dst) tetap setelah container down
+- sourcecode Protection: Host-side permission `750` (root:staff rwx, others no access)
+- docs Read-Only: Host-side directory tidak bisa dimodifikasi dari host (read-only mount atau special permission)
 Pada `Dockerfile`, base image yang digunakan adalah Ubuntu. Paket yang diinstall mencakup `samba`, `samba-common-bin`, `samba-vfs-modules`, `rsyslog`, `acl`, dan `procps`.
 
-- Dockerfile
-```dockerfile
-FROM ubuntu:latest
+Beriku adalah impemlementasi kode yang sesuai:
 
-ENV DEBIAN_FRONTEND=noninteractive
-
-RUN apt-get update && apt-get install -y \
-    samba \
-    samba-common-bin \
-    samba-vfs-modules \
-    rsyslog \
-    acl \
-    procps \
-    && rm -rf /var/lib/apt/lists/*
-```
-Paket `samba` digunakan untuk menjalankan SMB server. Paket `samba-common-bin` menyediakan tool seperti `smbpasswd` dan `pdbedit`, yang dipakai untuk mengatur user Samba. Paket `samba-vfs-modules` diperlukan karena sistem memakai modul `full_audit` untuk logging. Paket `rsyslog` dipakai untuk menangkap log audit Samba. Paket `acl` disiapkan untuk kebutuhan permission tambahan, sedangkan `procps` dipakai agar healthcheck dapat menjalankan command seperti `pgrep`.
-
-Masih di `Dockerfile`, file `smb.conf` dan `entrypoint.sh` disalin ke dalam container:
-
-```dockerfile
-COPY smb.conf /etc/samba/smb.conf
-COPY entrypoint.sh /entrypoint.sh
+- `docker-compose.yml`
+```yaml
+volumes:
+  - ./smb.conf:/etc/samba/smb.conf:ro
+  - ./data/ebooks:/libraryit/ebooks
+  - ./data/papers:/libraryit/papers
+  - ./data/sourcecode:/libraryit/sourcecode
+  - ./data/docs:/libraryit/docs
+  - ./logs:/logs
 ```
 
-Kemudian permission `entrypoint.sh` dibuat executable dan direktori awal dibuat:
+Folder `./data/ebooks` di host dipetakan ke `/libraryit/ebooks` di container. Pola yang sama digunakan untuk `papers`, `sourcecode`, dan `docs`. Folder `./logs` juga dipetakan ke `/logs` agar file log dapat dibaca dari luar container.
 
-```dockerfile
-RUN chmod +x /entrypoint.sh \
-    && mkdir -p /libraryit/ebooks /libraryit/papers /libraryit/sourcecode /libraryit/docs \
-    && mkdir -p /logs /var/log/samba /run/samba
+```yaml
+services:
+  libraryit-server:
+    build: .
+    container_name: libraryit-server
+    ports:
+      - "1445:445"
+    volumes:
+      - ./smb.conf:/etc/samba/smb.conf:ro
+      - ./data/ebooks:/libraryit/ebooks
+      - ./data/papers:/libraryit/papers
+      - ./data/sourcecode:/libraryit/sourcecode
+      - ./data/docs:/libraryit/docs
+      - ./logs:/logs
+    restart: unless-stopped
 ```
+Konfigurasi volume pada Docker Compose ini membuat beberapa folder dari host dipasang langsung ke dalam container, misalnya `./data/ebooks` di host akan muncul sebagai `/libraryit/ebooks` di container, begitu juga untuk `papers`, `sourcecode`, `docs`, dan `logs`. File `smb.conf` dipasang ke `/etc/samba/smb.conf` dengan mode `:ro`, artinya container hanya bisa membaca konfigurasi tersebut dan tidak dapat mengubahnya dari dalam. Karena folder data tidak memakai `:ro`, maka sifatnya read-write, sehingga file yang dibuat atau diubah di `/libraryit/` dalam container akan tersimpan dan tersinkron ke folder `./data/` di host.
+
 #### d - Logging
+
+Soal lalu meminta untuk  mencatat aktivitas akses koleksi, termasuk siapa yang mengakses, kapan akses dilakukan, dan aksi apa yang dilakukan. Log harus menggunakan format:
+
+```text
+[YYYY-MM-DD HH:MM:SS] [LEVEL] [USERNAME] [AKSI] [NAMA FILE/SHARE]
+```
+
+Level `INFO` digunakan untuk aktivitas normal, sedangkan level `WARNING` digunakan untuk percobaan akses yang ditolak. File log harus dapat dipantau dari luar container. Selain itu, harus ada service terpisah bernama `libraryit-logger` yang memonitor log secara real-time dan dapat dipantau melalui `docker logs`.
+
+Berikut adalah implementasi kode yang sesuai:
+
+```ini
+vfs objects = full_audit
+full_audit:prefix = %u|%S
+full_audit:success = all
+full_audit:failure = all
+full_audit:facility = LOCAL7
+full_audit:priority = NOTICE
+```
+
+Untuk `docs`, daftar operasi audit dapat dibuat lebih terbatas:
+
+```ini
+full_audit:success = connect disconnect openat pwrite pread renameat unlinkat
+full_audit:failure = connect openat pwrite pread renameat unlinkat
+```
+
+`full_audit:prefix = %u|%S` membuat raw log diawali username dan nama share. Ini digunakan karena formatter membutuhkan informasi user dan share. `facility = LOCAL7` membuat log audit dikirim ke syslog facility LOCAL7, lalu ditangkap oleh `rsyslog`
+
+- `entrypoint.sh`
+
+```bash
+cat > /etc/rsyslog.conf <<'EOF'
+module(load="imuxsock")
+
+global(workDirectory="/var/spool/rsyslog")
+
+local7.*    /var/log/samba/audit.raw
+EOF
+```
+
+Konfigurasi ini mengaktifkan socket syslog dan mengarahkan semua log `local7.*` ke `/var/log/samba/audit.raw`.
+
+Setelah itu, `audit_formatter.sh` dibuat secara dinamis oleh `entrypoint.sh`. Script ini membaca `/var/log/samba/audit.raw` secara real-time:
+
+```bash
+tail -n0 -F /var/log/samba/audit.raw
+```
+
+Setiap baris yang mengandung `smbd_audit` diambil, dipisahkan berdasarkan karakter `|`, lalu dipetakan menjadi field `user`, `share`, `op`, `result`, `mode`, dan `target`.
+
+Jika `result` bukan `ok`, log dibuat sebagai:
+
+```text
+[WARNING] [user] [DENIED] [share]
+```
+
+Jika operasi berhasil, formatter memetakan operasi Samba menjadi aksi yang lebih mudah dibaca:
+
+- `connect` menjadi `CONNECT`
+- `disconnect` menjadi `DISCONNECT`
+- `openat` dengan mode `r` menjadi `READ`
+- `openat` dengan mode `w` menjadi `WRITE`
+- `pwrite` menjadi `WRITE`
+- `unlinkat` menjadi `DELETE`
+- `renameat` menjadi `RENAME`
+
+Formatter juga membuang log `READ` terhadap direktori share itu sendiri agar log tidak terlalu penuh dengan operasi internal Samba.
+
+Untuk kasus access denied pada level share, `entrypoint.sh` membuat `denied_share_formatter.sh`:
+
+```bash
+tail -n0 -F /var/log/samba/libraryit-samba.log
+```
+
+Script ini mencari pesan seperti `not permitted to access this share`, `access denied`, atau `NT_STATUS_ACCESS_DENIED`. Jika ditemukan, script menulis log:
+
+```text
+[YYYY-MM-DD HH:MM:SS] [WARNING] [member] [DENIED] [SourceCode]
+```
+
+Service `libraryit-logger` pada `docker-compose.yml` membaca file log final:
+
+```yaml
+libraryit-logger:
+  image: alpine:3.20
+  container_name: libraryit-logger
+  depends_on:
+    libraryit-server:
+      condition: service_healthy
+  volumes:
+    - ./logs:/logs
+  command: sh -c "touch /logs/libraryit.log && tail -n +1 -f /logs/libraryit.log"
+  restart: unless-stopped
+```
+
+Dengan service ini, log dapat dipantau menggunakan:
+
+```bash
+docker logs -f libraryit-logger
+```
 
 ### Alur eksekusi
 
