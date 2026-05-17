@@ -1050,6 +1050,11 @@ set_samba_password() {
 
 
 
+#### b - Implementasi Role-Based Access Control
+
+
+
+#### c - Docker
 Pada `Dockerfile`, base image yang digunakan adalah Ubuntu. Paket yang diinstall mencakup `samba`, `samba-common-bin`, `samba-vfs-modules`, `rsyslog`, `acl`, dan `procps`.
 
 - Dockerfile
@@ -1083,13 +1088,6 @@ RUN chmod +x /entrypoint.sh \
     && mkdir -p /libraryit/ebooks /libraryit/papers /libraryit/sourcecode /libraryit/docs \
     && mkdir -p /logs /var/log/samba /run/samba
 ```
-
-
-
-#### b - Implementasi Role-Based Access Control
-
-#### c - Docker
-
 #### d - Logging
 
 ### Alur eksekusi
@@ -1204,3 +1202,8 @@ Terminal 1 seharusnya berisi output: # [YYYY-MM-DD HH:MM:XX] [INFO] [contributor
 ```
 cat ./logs/libraryit.log
 ```
+
+### REVISI
+
+#### SOAL 3
+Sebelumnya mohon maaf mas, saat demo sebelumnya saya mengatakan kalau akses dasar nya itu per user, ternyata setelah saya cek ulang sudah per grup.
