@@ -28,7 +28,20 @@ rm -rf amba_files.zip
 ![alt text](image-1.png)
 
 ### b. Buat Program FUSE
-Selanjutnyua, soal meminta untuk membuat program FUSE bernama `kenz_rescue.c`. Program tersebut akan menerima dua argumen yaitu <source_directory> dan <mount_directory>. Saat program di-mount, ketujuh file 1.txt sampai 7.txt harus muncul di mount directory dengan isi sama persis dengan source-passthrough untuk callback, readdir, open, dan read (mount directory hanya bertindak sebagai filesystem cermin yang hanya meneruskan operasi ke source)
+Selanjutnyua, soal meminta untuk membuat program FUSE bernama `kenz_rescue.c`. Program tersebut akan menerima dua argumen yaitu <source_directory> dan <mount_directory>. Saat program di-mount, ketujuh file 1.txt sampai 7.txt harus muncul di mount directory dengan isi sama persis dengan source-passthrough untuk callback, readdir, open, dan read (mount directory hanya bertindak sebagai filesystem cermin yang hanya meneruskan operasi ke source).
+
+Program akan dicompile dan dijalankan dengan cara berikut.
+
+- compile
+```bash
+gcc -D_FILE_OFFSET_BITS=64 `pkg-config --cflags fuse` \
+    kenz_rescue.c -o kenz_rescue `pkg-config --libs fuse`
+```
+
+- run
+```
+./kenz_rescue amba_files mnt
+```
 
 ```c
 int main(int argc, char *argv[])
@@ -670,3 +683,524 @@ Setelah tersambung, program masuk ke interactive loop, yaitu mode di mana user d
 
 ### SOAL 3 - LibraryIT
 
+#### a - Setup Server, User, Grup, dan Database
+Soal ini meminta untuk membuat sebuah server Docker bernama `libraryit-server` yang langsung siap digunakan setelah container dinyalakan. Server ini harus memiliki empat ruang penyimpanan koleksi, yaitu `ebooks`, `papers`, `sourcecode`, dan `docs`, semuanya berada di bawah direktori `/libraryit/`.
+
+Selain itu, server harus otomatis mengenali tiga user, yaitu:
+
+- `member` dengan password `member123`
+- `contributor` dengan password `contrib456`
+- `librarian` dengan password `lib789`
+
+Ketiga user tersebut harus dibagi ke dalam dua group:
+
+- `member` masuk ke group `readonly`
+- `contributor` dan `librarian` masuk ke group `staff`
+
+Seluruh user dan group harus dibuat otomatis saat container pertama kali dijalankan, tanpa setup manual setelah `docker compose up`. Untuk itu, sistem harus melakukan beberapa hal secara otomatis saat container start. Pertama, membuat direktori `/libraryit/ebooks`, `/libraryit/papers`, `/libraryit/sourcecode`, dan `/libraryit/docs`. Kedua, membuat group `readonly` dan `staff`. Ketiga, membuat user Linux `member`, `contributor`, dan `librarian`. Keempat, memasukkan masing-masing user ke group yang sesuai. Kelima, mendaftarkan user tersebut sebagai Samba user menggunakan password yang diminta soal.
+
+Semua proses ini diletakkan di dalam `entrypoint.sh`, karena file ini dijalankan setiap kali container dimulai.
+
+- entrypoint.sh
+```sh
+#!/bin/bash
+
+set -euo pipefail
+
+mkdir -p /libraryit/ebooks /libraryit/papers /libraryit/sourcecode /libraryit/docs
+mkdir -p /logs /var/log/samba /run/samba
+
+touch /logs/libraryit.log
+touch /var/log/samba/audit.raw
+touch /var/log/samba/libraryit-samba.log
+
+# =========================
+# GROUP SETUP
+# =========================
+
+ensure_group_with_gid() {
+    local groupname="$1"
+    local gid="$2"
+
+    if getent group "$groupname" >/dev/null; then
+        return
+    fi
+
+    existing_group="$(getent group "$gid" | cut -d: -f1 || true)"
+
+    if [ -n "$existing_group" ]; then
+        groupmod -n "$groupname" "$existing_group"
+    else
+        groupadd -g "$gid" "$groupname"
+    fi
+}
+
+ensure_group() {
+    local groupname="$1"
+
+    if ! getent group "$groupname" >/dev/null; then
+        groupadd "$groupname"
+    fi
+}
+
+ensure_group_with_gid staff 50
+ensure_group_with_gid readonly 1000
+ensure_group users
+
+
+# =========================
+# USER SETUP
+# =========================
+
+create_linux_user() {
+    local username="$1"
+    local uid="$2"
+    local groupname="$3"
+
+    if id "$username" >/dev/null 2>&1; then
+        usermod -aG "$groupname" "$username"
+        return
+    fi
+
+    existing_user="$(getent passwd "$uid" | cut -d: -f1 || true)"
+
+    if [ -n "$existing_user" ]; then
+        usermod -l "$username" "$existing_user"
+        usermod -d "/nonexistent" -s /usr/sbin/nologin -g users "$username"
+    else
+        useradd -M -N -s /usr/sbin/nologin -u "$uid" -g users "$username"
+    fi
+
+    usermod -aG "$groupname" "$username"
+}
+
+set_samba_password() {
+    local username="$1"
+    local password="$2"
+
+    if pdbedit -L | cut -d: -f1 | grep -qx "$username"; then
+        printf "%s\n%s\n" "$password" "$password" | smbpasswd -s "$username" >/dev/null
+    else
+        printf "%s\n%s\n" "$password" "$password" | smbpasswd -a -s "$username" >/dev/null
+    fi
+
+    pdbedit -u "$username" -f "" >/dev/null 2>&1 || true
+    smbpasswd -e "$username" >/dev/null
+}
+
+create_linux_user member 1000 readonly
+create_linux_user contributor 1001 staff
+create_linux_user librarian 1002 staff
+
+set_samba_password member "member123"
+set_samba_password contributor "contrib456"
+set_samba_password librarian "lib789"
+
+# =========================
+# DIRECTORY PERMISSIONS
+# =========================
+
+# ebooks dan papers:
+# staff bisa read/write, readonly hanya read lewat Samba.
+chown -R root:staff /libraryit/ebooks /libraryit/papers
+find /libraryit/ebooks /libraryit/papers -type d -exec chmod 0775 {} \;
+find /libraryit/ebooks /libraryit/papers -type f -exec chmod 0664 {} \;
+
+# sourcecode:
+# hanya owner dan group yang bisa akses dari host.
+# group staff bisa read/execute, tidak bisa write.
+chown -R root:staff /libraryit/sourcecode
+find /libraryit/sourcecode -type d -exec chmod 0750 {} \;
+find /libraryit/sourcecode -type f -exec chmod 0640 {} \;
+
+# docs:
+# dari host user biasa tidak bisa write karena owner-nya librarian.
+# dari Samba, hanya user librarian yang diizinkan write oleh smb.conf.
+chown -R librarian:staff /libraryit/docs
+find /libraryit/docs -type d -exec chmod 0755 {} \;
+find /libraryit/docs -type f -exec chmod 0644 {} \;
+
+chmod 0664 /logs/libraryit.log
+
+# =========================
+# RSYSLOG FOR SAMBA AUDIT
+# =========================
+
+cat > /etc/rsyslog.conf <<'EOF'
+module(load="imuxsock")
+
+global(workDirectory="/var/spool/rsyslog")
+
+local7.*    /var/log/samba/audit.raw
+EOF
+
+mkdir -p /var/spool/rsyslog
+rm -f /run/rsyslogd.pid
+rsyslogd -n &
+sleep 1
+
+# =========================
+# AUDIT LOG FORMATTER
+# =========================
+
+cat > /usr/local/bin/audit_formatter.sh <<'EOF'
+#!/bin/bash
+set -u
+
+touch /logs/libraryit.log
+
+tail -n0 -F /var/log/samba/audit.raw 2>/dev/null | while IFS= read -r line; do
+    [[ "$line" == *"smbd_audit"* ]] || continue
+
+    raw="$(printf '%s\n' "$line" | sed -E 's/^.*smbd_audit(\[[0-9]+\])?: //')"
+
+    IFS='|' read -ra parts <<< "$raw"
+
+    user="${parts[0]:-unknown}"
+    share="${parts[1]:-unknown}"
+    op="${parts[2]:-unknown}"
+    result="${parts[3]:-unknown}"
+    mode="${parts[4]:-}"
+
+    target="$share"
+
+    if [ "${#parts[@]}" -ge 6 ]; then
+        target="${parts[5]}"
+    elif [ "${#parts[@]}" -ge 5 ]; then
+        target="${parts[4]}"
+    fi
+
+    target="${target#/libraryit/}"
+    target="${target##*/}"
+
+    if [[ -z "$target" || "$target" == "ok" || "$target" == "r" || "$target" == "w" || "$op" == "connect" || "$op" == "disconnect" ]]; then
+        target="$share"
+    fi
+
+    level="INFO"
+    action="ACCESS"
+
+    if [[ "$result" != ok* ]]; then
+        level="WARNING"
+        action="DENIED"
+        target="$share"
+    else
+        case "$op" in
+            connect)
+                action="CONNECT"
+                target="$share"
+                ;;
+            disconnect)
+                action="DISCONNECT"
+                target="$share"
+                ;;
+            openat|open|create_file)
+                if [[ "$mode" == "w" || "$mode" == *"w"* ]]; then
+                    action="WRITE"
+                else
+                    action="READ"
+                fi
+                ;;
+            pread|opendir|readdir)
+                action="READ"
+                ;;
+            pwrite|mkdirat)
+                action="WRITE"
+                ;;
+            unlinkat)
+                action="DELETE"
+                ;;
+            renameat)
+                action="RENAME"
+                ;;
+            *)
+                continue
+                ;;
+        esac
+    fi
+
+    if [[ "$action" == "READ" && "$target" == "$share" ]]; then
+        continue
+    fi
+
+
+    printf '[%s] [%s] [%s] [%s] [%s]\n' \
+        "$(date '+%Y-%m-%d %H:%M:%S')" \
+        "$level" \
+        "$user" \
+        "$action" \
+        "$target" >> /logs/libraryit.log
+done
+EOF
+
+chmod +x /usr/local/bin/audit_formatter.sh
+/usr/local/bin/audit_formatter.sh &
+cat > /usr/local/bin/denied_share_formatter.sh <<'EOF'
+#!/bin/bash
+set -u
+
+tail -n0 -F /var/log/samba/libraryit-samba.log 2>/dev/null | while IFS= read -r line; do
+    echo "$line" | grep -Eiq "not permitted to access this share|access denied|NT_STATUS_ACCESS_DENIED" || continue
+
+    user="$(echo "$line" | sed -n "s/.*user '\([^']*\)'.*/\1/p")"
+    share="$(echo "$line" | sed -n "s/.*share (\([^)]*\)).*/\1/p")"
+
+    [ -z "$user" ] && user="member"
+    [ -z "$share" ] && share="SourceCode"
+
+    printf '[%s] [WARNING] [%s] [DENIED] [%s]\n' \
+        "$(date '+%Y-%m-%d %H:%M:%S')" \
+        "$user" \
+        "$share" >> /logs/libraryit.log
+done
+EOF
+
+chmod +x /usr/local/bin/denied_share_formatter.sh
+/usr/local/bin/denied_share_formatter.sh &
+exec smbd --foreground --no-process-group
+```
+
+- Alur program dimulai dengan pembuatan direktori.
+```bash
+mkdir -p /libraryit/ebooks /libraryit/papers /libraryit/sourcecode /libraryit/docs
+mkdir -p /logs /var/log/samba /run/samba
+```
+
+Setelah direktori dibuat, program lalu akan membuat group yang diimplementasikan melalui fungsi `ensure_group_with_gid()` dan `ensure_group()`.
+
+- `ensure_group_with_gid()` dan `ensure_group()`
+```sh
+ensure_group_with_gid() {
+    local groupname="$1"
+    local gid="$2"
+
+    if getent group "$groupname" >/dev/null; then
+        return
+    fi
+
+    existing_group="$(getent group "$gid" | cut -d: -f1 || true)"
+
+    if [ -n "$existing_group" ]; then
+        groupmod -n "$groupname" "$existing_group"
+    else
+        groupadd -g "$gid" "$groupname"
+    fi
+}
+
+ensure_group() {
+    local groupname="$1"
+
+    if ! getent group "$groupname" >/dev/null; then
+        groupadd "$groupname"
+    fi
+}
+```
+ Fungsi `ensure_group_with_gid()` menerima dua parameter, yaitu nama grup dan GID yang diinginkan. Pertama, fungsi mengecek apakah grup dengan nama tersebut sudah ada menggunakan `getent group "$groupname"`. Jika sudah ada, fungsi langsung berhenti karena tidak perlu membuat ulang grup. Jika grup belum ada, fungsi mengecek apakah GID yang diminta sudah dipakai oleh grup lain dengan `getent group "$gid"`. Jika GID tersebut sudah digunakan, nama grup lama akan diubah menggunakan `groupmod -n "$groupname" "$existing_group"` agar GID tetap sama tetapi namanya sesuai kebutuhan. Namun jika GID belum digunakan, fungsi akan membuat grup baru dengan `groupadd -g "$gid" "$groupname"`. 
+
+Sementara itu, fungsi `ensure_group()` hanya memastikan grup dengan nama tertentu ada. Jika belum ada, grup dibuat menggunakan `groupadd` tanpa menentukan GID khusus. `ensure_group_with_gid staff 50` memastikan grup `staff` tersedia dengan GID standar POSIX `50`, `ensure_group_with_gid readonly 1000` memastikan grup `readonly` tersedia dengan GID `1000`, dan `ensure_group users` memastikan grup `users` ada sebagai grup umum/default untuk user tertentu. 
+
+Setelah group berhasil dibuat, program lalu akan lanjut membuat user linux melalui fungsi `create_linux_user()`.
+
+- `create_linux_user()`
+```sh
+create_linux_user() {
+    local username="$1"
+    local uid="$2"
+    local groupname="$3"
+
+    if id "$username" >/dev/null 2>&1; then
+        usermod -aG "$groupname" "$username"
+        return
+    fi
+
+    existing_user="$(getent passwd "$uid" | cut -d: -f1 || true)"
+
+    if [ -n "$existing_user" ]; then
+        usermod -l "$username" "$existing_user"
+        usermod -d "/nonexistent" -s /usr/sbin/nologin -g users "$username"
+    else
+        useradd -M -N -s /usr/sbin/nologin -u "$uid" -g users "$username"
+    fi
+
+    usermod -aG "$groupname" "$username"
+}
+```
+
+Fungsi `create_linux_user()` digunakan untuk memastikan user Linux tertentu tersedia dengan UID dan grup yang sesuai. Pertama, fungsi mengecek apakah user dengan nama `$username` sudah ada. Jika sudah, user tersebut langsung ditambahkan ke grup sekunder `$groupname` menggunakan `usermod -aG`, lalu fungsi berhenti. Jika user belum ada, fungsi mengecek apakah UID `$uid` sudah digunakan oleh user lain. Jika sudah, user lama tersebut akan di-rename menjadi `$username`, lalu dikonfigurasi agar tidak memiliki home aktif, menggunakan shell `/usr/sbin/nologin`, dan primary group-nya diset ke `users`. Jika UID belum digunakan, fungsi membuat user baru dengan `useradd -M -N -s /usr/sbin/nologin -u "$uid" -g users "$username"`, kemudian pada bagian akhir user tetap ditambahkan ke grup sekunder `$groupname`, sehingga user tersebut bisa dipakai untuk kebutuhan akses sistem seperti Samba tanpa login interaktif.
+
+Setelah membuat user, program akan mendaftarkan user tersebut ke database Samba dengan password yang sudah ditentukan  melalui fungsi `set_samba_password`.
+
+```sh
+set_samba_password() {
+    local username="$1"
+    local password="$2"
+
+    if pdbedit -L | cut -d: -f1 | grep -qx "$username"; then
+        printf "%s\n%s\n" "$password" "$password" | smbpasswd -s "$username" >/dev/null
+    else
+        printf "%s\n%s\n" "$password" "$password" | smbpasswd -a -s "$username" >/dev/null
+    fi
+
+    pdbedit -u "$username" -f "" >/dev/null 2>&1 || true
+    smbpasswd -e "$username" >/dev/null
+}
+```
+
+ Pertama, fungsi mengecek apakah `$username` sudah terdaftar di Samba dengan `pdbedit -L`. Jika sudah ada, password-nya diperbarui menggunakan `smbpasswd -s`. Jika belum ada, user akan ditambahkan ke Samba database menggunakan `smbpasswd -a -s`. Password dikirim secara non-interaktif melalui `printf "%s\n%s\n"` karena `smbpasswd` membutuhkan input password dua kali, yaitu password dan konfirmasi password. Setelah password diatur, `pdbedit -u "$username" -f ""` digunakan untuk menyesuaikan field profil user, lalu `smbpasswd -e "$username"` mengaktifkan akun Samba agar bisa digunakan untuk login atau akses share.
+
+
+
+Pada `Dockerfile`, base image yang digunakan adalah Ubuntu. Paket yang diinstall mencakup `samba`, `samba-common-bin`, `samba-vfs-modules`, `rsyslog`, `acl`, dan `procps`.
+
+- Dockerfile
+```dockerfile
+FROM ubuntu:latest
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y \
+    samba \
+    samba-common-bin \
+    samba-vfs-modules \
+    rsyslog \
+    acl \
+    procps \
+    && rm -rf /var/lib/apt/lists/*
+```
+Paket `samba` digunakan untuk menjalankan SMB server. Paket `samba-common-bin` menyediakan tool seperti `smbpasswd` dan `pdbedit`, yang dipakai untuk mengatur user Samba. Paket `samba-vfs-modules` diperlukan karena sistem memakai modul `full_audit` untuk logging. Paket `rsyslog` dipakai untuk menangkap log audit Samba. Paket `acl` disiapkan untuk kebutuhan permission tambahan, sedangkan `procps` dipakai agar healthcheck dapat menjalankan command seperti `pgrep`.
+
+Masih di `Dockerfile`, file `smb.conf` dan `entrypoint.sh` disalin ke dalam container:
+
+```dockerfile
+COPY smb.conf /etc/samba/smb.conf
+COPY entrypoint.sh /entrypoint.sh
+```
+
+Kemudian permission `entrypoint.sh` dibuat executable dan direktori awal dibuat:
+
+```dockerfile
+RUN chmod +x /entrypoint.sh \
+    && mkdir -p /libraryit/ebooks /libraryit/papers /libraryit/sourcecode /libraryit/docs \
+    && mkdir -p /logs /var/log/samba /run/samba
+```
+
+
+
+#### b - Implementasi Role-Based Access Control
+
+#### c - Docker
+
+#### d - Logging
+
+### Alur eksekusi
+
+1. Build Docker Image
+
+    ```docker
+    docker build -t libraryit:latest .
+    ```
+
+2. Start Docker Compose
+
+    ```
+    docker-compose up -d
+    ```
+
+    - verify
+    ```
+    docker-compose ps
+    ```
+
+3. Cek User
+
+    ```
+    docker exec -it libraryit-server pdbedit -L
+    ```
+
+4. Cek Group
+    ```
+    docker exec -it libraryit-server getent group staff readonly users
+    ```
+
+5. Tes Akses Kontrol
+
+    - Member list share
+    ```
+    smbclient -L //localhost:1445 -U member%member123
+    ```
+
+    expected output: ebooks, papers, docs muncul sedangkan SourceCode tidak muncul.
+
+    - Member read ebooks
+    ```
+    smbclient //localhost/ebooks -p 1445 -U member%member123 <<EOF
+    list
+    quit
+    EOF
+    ```
+
+    Expected output: LIST success
+
+    - Member tidak bisa write ebooks
+    ```
+    smbclient //localhost/ebooks -p 1445 -U member%member123 <<EOF
+    put /etc/hostname testfile.txt
+    quit
+    EOF
+    ```
+    Expected output: NT_STATUS_ACCESS_DENIED
+
+    - Member tidak bisa akses sourcecode
+    ```
+    smbclient //localhost/SourceCode -p 1445 -U member%member123
+    ```
+    Expected output: tree connect failed: NT_STATUS_ACCESS_DENIED
+
+    - Contributor write ebooks
+    ```
+    smbclient //localhost/ebooks -p 1445 -U contributor%contrib456 <<EOF
+    put /etc/hostname testfile.txt
+    quit
+    EOF
+    ````
+
+    Expected output: putting file testfile.txt as \testfile.txt (XXX bytes)`````
+
+    - Contributor tidak bisa write docs
+    ```
+    smbclient //localhost/docs -p 1445 -U contributor%contrib456 <<EOF
+    put /etc/hostname testfile.txt
+    quit
+    EOF
+    ```
+
+    Expected output: NT_STATUS_ACCESS_DENIED
+
+    - Librarian bisa write docs
+    ```
+    smbclient //localhost/docs -p 1445 -U librarian%lib789 <<EOF
+    put /etc/hostname librarianfile.txt
+    quit
+    EOF
+    ```
+
+    Expected output: putting file librarianfile.txt as \librarianfile.txt (XXX bytes)
+
+6. Monitor Logs
+
+- Terminal 1
+```
+docker logs -f libraryit-logger
+```
+
+- Terminal 2
+```
+smbclient //localhost/ebooks -p 1445 -U contributor%contrib456 -c "put /etc/hostname logtest.txt"
+```
+
+Terminal 1 seharusnya berisi output: # [YYYY-MM-DD HH:MM:XX] [INFO] [contributor] [WRITE] [logtest.txt]
+
+- Lihat full log
+```
+cat ./logs/libraryit.log
+```

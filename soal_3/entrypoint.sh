@@ -1,4 +1,5 @@
 #!/bin/bash
+
 set -euo pipefail
 
 mkdir -p /libraryit/ebooks /libraryit/papers /libraryit/sourcecode /libraryit/docs
